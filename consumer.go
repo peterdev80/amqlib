@@ -57,17 +57,34 @@ type ConsumerHandler = func(msg amqp091.Delivery) error
 
 // Consumer описывает обработчик входящих сообщений.
 type Consumer struct {
-	al   Algoritm
+	al   Algoritm         // тип exchange
 	Name string           // Имя используемое для точки обмена (exchange or queue)
 	eopt *ExchangeOptions // Опции для exchange, если nil то используются по умолчанию
 	copt *ConsumeOptions  // Опции для consume
 
 	handler ConsumerHandler     // Обработчик сообщений
 	topics  map[string]struct{} // Список поддерживаемых тем
-	// connected bool // Флаг активного соединения
 
-	// topicAddCh chan string // Канал для подписки на новые темы
-	// topicDelCh chan string // Канал для отписки
+}
+
+// NewConsumer создаем нового слушателя, передав ему
+// al - алгоритм распределения
+// name - наименования exchange
+// eopt, copt - опции для exchange и consume, допустима передача nil, будет использована настройка из док.,
+// handler - функция, которая производит действие с сообщением очереди, функции запускаются в одном потоке,
+// для достижения асинхронности использовать отдельную горутину внутри handler
+// topics
+func NewConsumer(al Algoritm, name string, eopt *ExchangeOptions, copt *ConsumeOptions,
+	handler ConsumerHandler, topics ...string) *Consumer {
+	c := &Consumer{al: al, Name: name, eopt: eopt, copt: copt, handler: handler}
+	// инициализируем список подписок
+	subscription := make(map[string]struct{}, len(topics))
+	for _, topic := range topics {
+		subscription[topic] = struct{}{}
+	}
+	c.topics = subscription
+
+	return c
 }
 
 var _ Membered = (*Consumer)(nil)
@@ -134,8 +151,8 @@ func (c *Consumer) Work(ctx context.Context, channel *amqp091.Channel) error {
 	if err != nil {
 		return fmt.Errorf("consume initialization error: %w", err)
 	}
-
-	if c.al == Topics {
+	switch c.al {
+	case Topics:
 		for topic := range c.topics {
 			err := channel.QueueBind(
 				queName, // queue name
@@ -148,6 +165,18 @@ func (c *Consumer) Work(ctx context.Context, channel *amqp091.Channel) error {
 				return fmt.Errorf("queue %q topic %q bind error: %w", queName, topic, err)
 			}
 		}
+	case PubSub:
+		err := channel.QueueBind(
+			queName, // queue name
+			"",      // routing key
+			c.Name,  // exchange
+			false,
+			nil,
+		)
+		if err != nil {
+			return fmt.Errorf("queue %q  bind error: %w", queName, err)
+		}
+
 	}
 
 	for {

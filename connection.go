@@ -2,6 +2,7 @@ package amqlib
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog/log"
@@ -41,7 +42,7 @@ func NewConnect(reconnectTime time.Duration, maxIteration int, addr Addr) *Conne
 }
 
 //  Подключение к rabbit
-// В случае ошибки подключения попытка повторяется несколько раз (MaxIteration) с небольшой задержкой (ReconnectTime).
+// В случае ошибки подключения попытка повторяется несколько раз (maxIteration) с небольшой задержкой (ReconnectTime).
 // возвращаем само подключение, или ошибку
 func (a Addr) connect(maxIteration int, reconnectTime time.Duration) (*amqp091.Connection, error) {
 	var (
@@ -73,12 +74,16 @@ func (a Addr) connect(maxIteration int, reconnectTime time.Duration) (*amqp091.C
 
 // OnTask запуск участников обмена
 func (c *Connect) OnTask(ctx context.Context, members ...Membered) error {
-	step := 0
-	addr := c.addr
-	mi := c.maxIteration
-	rt := c.reconnectTime
+	var (
+		step = 0
+		addr = c.addr
+		mi   = c.maxIteration
+		rt   = c.reconnectTime
+	)
+
 	for {
-		log.Info().Int("step", step).Msg("run OnTask")
+
+		log.Debug().Int("step", step).Msg("run OnTask")
 		conn, err := addr.connect(mi, rt)
 		if err != nil {
 			return fmt.Errorf("connection error: %w", err)
@@ -90,9 +95,8 @@ func (c *Connect) OnTask(ctx context.Context, members ...Membered) error {
 			case err = <-conn.NotifyClose(make(chan *amqp091.Error)):
 				return fmt.Errorf("connection close: %w", err)
 
-			case <-gCtx.Done(): // плановое завершение
-				err := gCtx.Err()
-				return fmt.Errorf("connection done: %w", err)
+			case <-ctx.Done(): // плановое завершение
+				return nil
 			}
 		})
 
@@ -111,7 +115,7 @@ func (c *Connect) OnTask(ctx context.Context, members ...Membered) error {
 				defer ch.Close()
 				err := service.Work(gCtx, ch) // запускаем обработчик сервиса на заданном канале
 				if err != nil {
-					return fmt.Errorf("member error: %w", err)
+					return fmt.Errorf("work member error: %w", err)
 				}
 				return nil
 			})
@@ -122,9 +126,12 @@ func (c *Connect) OnTask(ctx context.Context, members ...Membered) error {
 
 		conn.Close() // закрываем по окончанию
 
-		if gCtx.Err() == nil {
+		if gCtx.Err() == nil || errors.Is(gCtx.Err(), context.Canceled) {
 			return nil // плановое завершение если завершение по контексту
 		}
-
+		if step > c.maxIteration {
+			return err
+		}
+		step++
 	}
 }
