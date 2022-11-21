@@ -152,7 +152,7 @@ func (c *Consumer) Work(ctx context.Context, channel *amqp091.Channel) error {
 		return fmt.Errorf("consume initialization error: %w", err)
 	}
 	switch c.al {
-	case Topics:
+	case Topics, Routing:
 		for topic := range c.topics {
 			err := channel.QueueBind(
 				queName, // queue name
