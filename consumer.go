@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/rabbitmq/amqp091-go"
+	"sync"
 )
 
 type Algoritm int
@@ -30,59 +31,96 @@ func (a Algoritm) getType() string {
 
 // ExchangeOptions опции которые необходимо установить exchange
 type ExchangeOptions struct {
-	durable     bool
-	autodeleted bool
-	internal    bool
-	nowait      bool
-	arguments   amqp091.Table
+	Durable     bool
+	Autodeleted bool
+	Internal    bool
+	Nowait      bool
+	Arguments   amqp091.Table
 }
 
 type ConsumeOptions struct {
-	autoack   bool
-	exclusive bool
-	nolocal   bool
-	nowait    bool
-	arguments amqp091.Table
+	Autoack   bool
+	Exclusive bool
+	Nolocal   bool
+	Nowait    bool
+	Arguments amqp091.Table
 }
 
-func NewConsumeOptions(autoack bool, exclusive bool, nolocal bool, nowait bool, arguments amqp091.Table) *ConsumeOptions {
-	return &ConsumeOptions{autoack: autoack, exclusive: exclusive, nolocal: nolocal, nowait: nowait, arguments: arguments}
+type options struct {
+	eopt   ExchangeOptions // Опции для exchange, если nil то используются по умолчанию
+	copt   ConsumeOptions  // Опции для consume
+	topics []string        // Список поддерживаемых тем
+}
+type Option interface {
+	apply(*options)
 }
 
-func NewExchangeOptions(durable bool, autodeleted bool, internal bool, nowait bool, arguments amqp091.Table) *ExchangeOptions {
-	return &ExchangeOptions{durable: durable, autodeleted: autodeleted, internal: internal, nowait: nowait, arguments: arguments}
+type optionFunc func(*options)
+
+func (f optionFunc) apply(o *options) {
+	f(o)
+}
+func WithExchange(eopt ExchangeOptions) Option {
+	return optionFunc(func(o *options) {
+		o.eopt = eopt
+	})
+}
+func WithConsume(copt ConsumeOptions) Option {
+	return optionFunc(func(o *options) {
+		o.copt = copt
+	})
+}
+func WithTopics(topics ...string) Option {
+	return optionFunc(func(o *options) {
+		o.topics = topics
+	})
 }
 
+// ConsumerHandler функция для обработки входящего сообщения из rabbitMQ
 type ConsumerHandler = func(msg amqp091.Delivery) error
 
 // Consumer описывает обработчик входящих сообщений.
 type Consumer struct {
-	al   Algoritm         // тип exchange
-	Name string           // Имя используемое для точки обмена (exchange or queue)
-	eopt *ExchangeOptions // Опции для exchange, если nil то используются по умолчанию
-	copt *ConsumeOptions  // Опции для consume
+	al   Algoritm // тип exchange
+	Name string   // Имя используемое для точки обмена (exchange or queue)
+	// eopt *ExchangeOptions // Опции для exchange, если nil то используются по умолчанию
+	// copt *ConsumeOptions  // Опции для consume
 
-	handler ConsumerHandler     // Обработчик сообщений
-	topics  map[string]struct{} // Список поддерживаемых тем
+	handler ConsumerHandler // Обработчик сообщений
+	// topics  map[string]struct{} // Список поддерживаемых тем
 
+	Options options
 }
 
 // NewConsumer создаем нового слушателя, передав ему
 // al - алгоритм распределения
 // name - наименования exchange
-// eopt, copt - опции для exchange и consume, допустима передача nil, будет использована настройка из док.,
 // handler - функция, которая производит действие с сообщением очереди, функции запускаются в одном потоке,
 // для достижения асинхронности использовать отдельную горутину внутри handler
 // topics
-func NewConsumer(al Algoritm, name string, eopt *ExchangeOptions, copt *ConsumeOptions,
-	handler ConsumerHandler, topics ...string) *Consumer {
-	c := &Consumer{al: al, Name: name, eopt: eopt, copt: copt, handler: handler}
-	// инициализируем список подписок
-	subscription := make(map[string]struct{}, len(topics))
-	for _, topic := range topics {
-		subscription[topic] = struct{}{}
+func NewConsumer(al Algoritm, name string, handler ConsumerHandler, opts ...Option) *Consumer {
+	c := &Consumer{al: al, Name: name, handler: handler}
+
+	c.Options = options{
+		eopt: ExchangeOptions{
+			Durable:     true,
+			Autodeleted: false,
+			Internal:    false,
+			Nowait:      false,
+			Arguments:   nil,
+		},
+		copt: ConsumeOptions{
+			Autoack:   true,
+			Exclusive: false,
+			Nolocal:   false,
+			Nowait:    false,
+			Arguments: nil,
+		},
+		topics: nil,
 	}
-	c.topics = subscription
+	for _, o := range opts {
+		o.apply(&c.Options)
+	}
 
 	return c
 }
@@ -97,18 +135,14 @@ func (c *Consumer) initExchange(ch *amqp091.Channel) (string, error) {
 
 	if c.al != Queue {
 
-		if c.eopt == nil {
-			c.eopt = NewExchangeOptions(true, false, false, false, nil)
-		}
-
 		err := ch.ExchangeDeclare(
-			c.Name,             // name
-			c.al.getType(),     // type
-			c.eopt.durable,     // durable
-			c.eopt.autodeleted, // auto-deleted
-			c.eopt.internal,    // internal
-			c.eopt.nowait,      // no-wait
-			c.eopt.arguments,   // arguments
+			c.Name,                     // name
+			c.al.getType(),             // type
+			c.Options.eopt.Durable,     // durable
+			c.Options.eopt.Autodeleted, // auto-deleted
+			c.Options.eopt.Internal,    // internal
+			c.Options.eopt.Nowait,      // no-wait
+			c.Options.eopt.Arguments,   // arguments
 		)
 		if err != nil {
 			return "", fmt.Errorf("exchange declare error: %w", err)
@@ -131,29 +165,16 @@ func (c *Consumer) initExchange(ch *amqp091.Channel) (string, error) {
 	return q.Name, nil
 }
 
-func (c *Consumer) Work(ctx context.Context, channel *amqp091.Channel) error {
+func (c *Consumer) Work(ctx context.Context, wg *sync.WaitGroup, channel *amqp091.Channel) error {
+
 	queName, err := c.initExchange(channel)
 	if err != nil {
 		return err
 	}
-	if c.copt == nil {
-		c.copt = NewConsumeOptions(true, false, false, false, nil)
-	}
-	msgs, err := channel.Consume(
-		queName,          // queue
-		"",               // consumer
-		c.copt.autoack,   // auto ack
-		c.copt.exclusive, // exclusive
-		c.copt.nolocal,   // no local
-		c.copt.nowait,    // no wait
-		c.copt.arguments, // args
-	)
-	if err != nil {
-		return fmt.Errorf("consume initialization error: %w", err)
-	}
+
 	switch c.al {
 	case Topics, Routing:
-		for topic := range c.topics {
+		for _, topic := range c.Options.topics {
 			err := channel.QueueBind(
 				queName, // queue name
 				topic,   // routing key
@@ -179,6 +200,20 @@ func (c *Consumer) Work(ctx context.Context, channel *amqp091.Channel) error {
 
 	}
 
+	msgs, err := channel.Consume(
+		queName,                  // queue
+		"",                       // consumer
+		c.Options.copt.Autoack,   // auto ack
+		c.Options.copt.Exclusive, // exclusive
+		c.Options.copt.Nolocal,   // no local
+		c.Options.copt.Nowait,    // no wait
+		c.Options.copt.Arguments, // args
+	)
+	if err != nil {
+		return fmt.Errorf("consume initialization error: %w", err)
+	}
+
+	wg.Done()
 	for {
 		select {
 		case <-ctx.Done(): // плановое завершение
@@ -189,10 +224,7 @@ func (c *Consumer) Work(ctx context.Context, channel *amqp091.Channel) error {
 
 			return fmt.Errorf(" work channel error: %w", err)
 
-		case m, ok := <-msgs: // входящие сообщения
-			if !ok {
-				return nil // канал с сообщениями закрыт
-			}
+		case m := <-msgs: // входящие сообщения
 
 			// вызываем обработчик события
 			if err := c.handler(m); err != nil {

@@ -6,7 +6,6 @@ import (
 	"github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/suite"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -14,24 +13,25 @@ import (
 
 // StringMsg принимает строку и преобразует в message
 type StringMsg struct {
-	ttl int
+	data  string
+	topic string
 }
 
-// NewStringMsg создает текстовое сообщение с ttl  отличным от 0
-func NewStringMsg(ttl int) *StringMsg {
-	return &StringMsg{ttl: ttl}
+// NewStringMsg создает текстовое сообщение с
+func NewStringMsg(data, topic string) *StringMsg {
+	return &StringMsg{data: data, topic: topic}
 }
-
-func (str *StringMsg) Message(t interface{}) amqp091.Publishing {
+func (str *StringMsg) Key() string {
+	return str.topic
+}
+func (str *StringMsg) Message() amqp091.Publishing {
 	ret := amqp091.Publishing{
 		ContentType: "text",
 		Timestamp:   time.Now(),
 		Type:        "StringMsg",
-		Body:        []byte(t.(string)),
+		Body:        []byte(str.data),
 	}
-	if str.ttl != 0 {
-		ret.Expiration = strconv.Itoa(str.ttl)
-	}
+
 	return ret
 }
 
@@ -98,7 +98,7 @@ func (ms *MainSuite) TestConnect_OnTask() {
 	}{
 		{name: "Correct cancel",
 			fields:  fields{reconnectTime: time.Second, maxIteration: 5, addr: rl},
-			args:    args{ctx: ctxcancel, members: []Membered{NewPublisher(1, "qwerty", 10, 10, 1)}},
+			args:    args{ctx: ctxcancel, members: []Membered{NewPublisher(1, "qwerty", nil, 10, 10, 1)}},
 			wantErr: false,
 		},
 	}
@@ -107,10 +107,10 @@ func (ms *MainSuite) TestConnect_OnTask() {
 		c := NewConnect(tt.fields.reconnectTime, tt.fields.maxIteration, tt.fields.addr)
 		wg := sync.WaitGroup{}
 		wg.Add(1)
-		go func() {
-			wg.Done()
 
-			err := c.OnTask(tt.args.ctx, tt.args.members...)
+		go func() {
+
+			err := c.OnTask(tt.args.ctx, &wg, tt.args.members...)
 			ms.Assert().NoError(err, "корректное завершение работы")
 
 		}()

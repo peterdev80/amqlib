@@ -5,7 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"github.com/rabbitmq/amqp091-go"
-	"github.com/rs/zerolog/log"
+	"sync"
+
 	"golang.org/x/sync/errgroup"
 	"strconv"
 	"time"
@@ -37,6 +38,10 @@ type Connect struct {
 	addr          Addr          // Строка подключения
 }
 
+// NewConnect новое подключение к сервису rabbitMQ
+// reconnectTime -задержка перед повторным соединением
+// maxIteration - максимальное количество попыток соединения
+// addr - строка подключения
 func NewConnect(reconnectTime time.Duration, maxIteration int, addr Addr) *Connect {
 	return &Connect{reconnectTime: reconnectTime, maxIteration: maxIteration, addr: addr}
 }
@@ -58,12 +63,6 @@ func (a Addr) connect(maxIteration int, reconnectTime time.Duration) (*amqp091.C
 			return conn, nil // в случае успешного подключения сразу возвращаем его
 		}
 
-		log.Debug().
-			Err(err).
-			Int("iteration", i+1).
-			Dur("delay", reconnectTime).
-			Msg("connection iteration")
-
 		time.Sleep(reconnectTime) // задержка перед повтором попытки соединения
 	}
 
@@ -73,7 +72,7 @@ func (a Addr) connect(maxIteration int, reconnectTime time.Duration) (*amqp091.C
 }
 
 // OnTask запуск участников обмена
-func (c *Connect) OnTask(ctx context.Context, members ...Membered) error {
+func (c *Connect) OnTask(ctx context.Context, onstart *sync.WaitGroup, members ...Membered) error {
 	var (
 		step = 0
 		addr = c.addr
@@ -83,7 +82,6 @@ func (c *Connect) OnTask(ctx context.Context, members ...Membered) error {
 
 	for {
 
-		log.Debug().Int("step", step).Msg("run OnTask")
 		conn, err := addr.connect(mi, rt)
 		if err != nil {
 			return fmt.Errorf("connection error: %w", err)
@@ -110,10 +108,12 @@ func (c *Connect) OnTask(ctx context.Context, members ...Membered) error {
 			}
 
 			service := member // копируем в текущий стек
+			onstart.Add(1)
 			// запускаем обработку участника в отдельном потоке
 			g.Go(func() error {
 				defer ch.Close()
-				err := service.Work(gCtx, ch) // запускаем обработчик сервиса на заданном канале
+
+				err := service.Work(gCtx, onstart, ch) // запускаем обработчик сервиса на заданном канале
 				if err != nil {
 					return fmt.Errorf("work member error: %w", err)
 				}
@@ -122,6 +122,7 @@ func (c *Connect) OnTask(ctx context.Context, members ...Membered) error {
 
 		}
 
+		onstart.Done()
 		err = g.Wait()
 
 		conn.Close() // закрываем по окончанию
