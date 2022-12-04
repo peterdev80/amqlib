@@ -78,7 +78,7 @@ func (ms *MainSuite) SetupSuite() {
 }
 
 func (ms *MainSuite) TestConnect_OnTask() {
-	rl := URI("user", "user", "localhost", "5672")
+	rl := URI("user", "user", "localhost", ms.resource.GetPort("5672/tcp"))
 	ctxcancel, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	type fields struct {

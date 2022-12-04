@@ -12,6 +12,7 @@ import (
 	"time"
 )
 
+// Addr предназначен для получения строки адреса подключения к rabbit
 type Addr string
 
 // URI является вспомогательной функцией, возвращающей строку с описанием схемы для подключения к серверу RabbitMQ.
@@ -46,7 +47,8 @@ func NewConnect(reconnectTime time.Duration, maxIteration int, addr Addr) *Conne
 	return &Connect{reconnectTime: reconnectTime, maxIteration: maxIteration, addr: addr}
 }
 
-//  Подключение к rabbit
+//	Подключение к rabbit
+//
 // В случае ошибки подключения попытка повторяется несколько раз (maxIteration) с небольшой задержкой (ReconnectTime).
 // возвращаем само подключение, или ошибку
 func (a Addr) connect(maxIteration int, reconnectTime time.Duration) (*amqp091.Connection, error) {

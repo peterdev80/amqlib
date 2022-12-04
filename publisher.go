@@ -52,15 +52,12 @@ var ErrPushFull = errors.New("publication channel is full")
 // Если очередь переполнена и сообщения не отправляются, то возвращается ошибка ErrPushFull.
 // Время жизни устанавливается общее
 func (p *Publisher) Push(m Published) error {
+
 	// проверяем, что канал не переполнен
 	if c := cap(p.msgs); c > 1 && len(p.msgs) == c {
 		return ErrPushFull
 	}
-	/*var (
-		exp = strconv.Itoa(p.TTL)
-	)
-	m.Expiration = exp*/
-	// m.Expiration = "10000"
+
 	p.msgs <- m // помещаем сообщение в очередь на отправку
 
 	return nil
@@ -70,23 +67,25 @@ func (p *Publisher) Push(m Published) error {
 func (p *Publisher) Work(ctx context.Context, wg *sync.WaitGroup, ch *amqp091.Channel) error {
 	// копируем описание элементов Publisher
 	var (
-		exchange = p.Exchange       // Название точки обмена
+		exchange string             // Название точки обмена
 		exchType = p.Type.getType() // Тип точки обмена
 
 	)
-
-	// инициализируем описание и проверяем параметры точки обмена
-	err := ch.ExchangeDeclare(
-		exchange,           // name
-		exchType,           // type
-		p.eopt.Durable,     // durable
-		p.eopt.Autodeleted, // auto-deleted
-		p.eopt.Internal,    // internal
-		p.eopt.Nowait,      // no-wait
-		p.eopt.Arguments,   // arguments
-	)
-	if err != nil {
-		return fmt.Errorf("exchange declare error: %w", err)
+	if p.Type != Queue {
+		exchange = p.Exchange
+		// инициализируем описание и проверяем параметры точки обмена
+		err := ch.ExchangeDeclare(
+			exchange,           // name
+			exchType,           // type
+			p.eopt.Durable,     // durable
+			p.eopt.Autodeleted, // auto-deleted
+			p.eopt.Internal,    // internal
+			p.eopt.Nowait,      // no-wait
+			p.eopt.Arguments,   // arguments
+		)
+		if err != nil {
+			return fmt.Errorf("exchange declare error: %w", err)
+		}
 	}
 	wg.Done()
 	for {
@@ -102,8 +101,12 @@ func (p *Publisher) Work(ctx context.Context, wg *sync.WaitGroup, ch *amqp091.Ch
 		case msgp := <-p.msgs: // сообщение для отправки
 
 			msg, key := msgp.Message(), msgp.Key()
+			if key == "" && p.Type == Queue {
+				key = p.Exchange
+			}
 			msg.Expiration = strconv.Itoa(p.TTL)
 			ctxm, cancel := context.WithTimeout(ctx, p.SendTime)
+
 			err := ch.PublishWithContext(ctxm, exchange, key, false, false, msg)
 			cancel()
 
@@ -112,4 +115,5 @@ func (p *Publisher) Work(ctx context.Context, wg *sync.WaitGroup, ch *amqp091.Ch
 			}
 		}
 	}
+
 }

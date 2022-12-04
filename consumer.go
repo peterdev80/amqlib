@@ -7,75 +7,6 @@ import (
 	"sync"
 )
 
-type Algoritm int
-
-const (
-	Queue Algoritm = iota
-	PubSub
-	Routing
-	Topics
-)
-
-// getType преобразовать в string rabbit
-func (a Algoritm) getType() string {
-	switch a {
-	case PubSub:
-		return "fanout"
-	case Routing:
-		return "direct"
-	case Topics:
-		return "topic"
-	}
-	return ""
-}
-
-// ExchangeOptions опции которые необходимо установить exchange
-type ExchangeOptions struct {
-	Durable     bool
-	Autodeleted bool
-	Internal    bool
-	Nowait      bool
-	Arguments   amqp091.Table
-}
-
-type ConsumeOptions struct {
-	Autoack   bool
-	Exclusive bool
-	Nolocal   bool
-	Nowait    bool
-	Arguments amqp091.Table
-}
-
-type options struct {
-	eopt   ExchangeOptions // Опции для exchange, если nil то используются по умолчанию
-	copt   ConsumeOptions  // Опции для consume
-	topics []string        // Список поддерживаемых тем
-}
-type Option interface {
-	apply(*options)
-}
-
-type optionFunc func(*options)
-
-func (f optionFunc) apply(o *options) {
-	f(o)
-}
-func WithExchange(eopt ExchangeOptions) Option {
-	return optionFunc(func(o *options) {
-		o.eopt = eopt
-	})
-}
-func WithConsume(copt ConsumeOptions) Option {
-	return optionFunc(func(o *options) {
-		o.copt = copt
-	})
-}
-func WithTopics(topics ...string) Option {
-	return optionFunc(func(o *options) {
-		o.topics = topics
-	})
-}
-
 // ConsumerHandler функция для обработки входящего сообщения из rabbitMQ
 type ConsumerHandler = func(msg amqp091.Delivery) error
 
@@ -89,7 +20,7 @@ type Consumer struct {
 	handler ConsumerHandler // Обработчик сообщений
 	// topics  map[string]struct{} // Список поддерживаемых тем
 
-	Options options
+	ops options
 }
 
 // NewConsumer создаем нового слушателя, передав ему
@@ -101,7 +32,7 @@ type Consumer struct {
 func NewConsumer(al Algoritm, name string, handler ConsumerHandler, opts ...Option) *Consumer {
 	c := &Consumer{al: al, Name: name, handler: handler}
 
-	c.Options = options{
+	c.ops = options{
 		eopt: ExchangeOptions{
 			Durable:     true,
 			Autodeleted: false,
@@ -116,10 +47,18 @@ func NewConsumer(al Algoritm, name string, handler ConsumerHandler, opts ...Opti
 			Nowait:    false,
 			Arguments: nil,
 		},
+		qopt: QueueOptions{
+			Durable:     false,
+			Autodeleted: false,
+			Exclusive:   true,
+			Nowait:      false,
+			Arguments:   nil,
+		},
 		topics: nil,
+		qos:    nil,
 	}
 	for _, o := range opts {
-		o.apply(&c.Options)
+		o.apply(&c.ops)
 	}
 
 	return c
@@ -136,13 +75,13 @@ func (c *Consumer) initExchange(ch *amqp091.Channel) (string, error) {
 	if c.al != Queue {
 
 		err := ch.ExchangeDeclare(
-			c.Name,                     // name
-			c.al.getType(),             // type
-			c.Options.eopt.Durable,     // durable
-			c.Options.eopt.Autodeleted, // auto-deleted
-			c.Options.eopt.Internal,    // internal
-			c.Options.eopt.Nowait,      // no-wait
-			c.Options.eopt.Arguments,   // arguments
+			c.Name,                 // name
+			c.al.getType(),         // type
+			c.ops.eopt.Durable,     // durable
+			c.ops.eopt.Autodeleted, // auto-deleted
+			c.ops.eopt.Internal,    // internal
+			c.ops.eopt.Nowait,      // no-wait
+			c.ops.eopt.Arguments,   // arguments
 		)
 		if err != nil {
 			return "", fmt.Errorf("exchange declare error: %w", err)
@@ -152,19 +91,32 @@ func (c *Consumer) initExchange(ch *amqp091.Channel) (string, error) {
 	}
 
 	q, err := ch.QueueDeclare(
-		queName, // name
-		false,   // durable
-		false,   // delete when unused
-		true,    // exclusive
-		false,   // no-wait
-		nil,     // arguments
+		queName,                // name
+		c.ops.qopt.Durable,     // durable
+		c.ops.qopt.Autodeleted, // delete when unused
+		c.ops.qopt.Exclusive,   // exclusive
+		c.ops.qopt.Nowait,      // no-wait
+		c.ops.qopt.Arguments,   // arguments
 	)
 	if err != nil {
 		return "", fmt.Errorf("queue declare error: %w", err)
 	}
+
+	if c.ops.qos != nil {
+		err = ch.Qos(
+			c.ops.qos.PCount, // prefetch count
+			c.ops.qos.PSize,  // prefetch size
+			c.ops.qos.Global, // global
+		)
+		if err != nil {
+			return "", fmt.Errorf("queue declare qos error: %w", err)
+		}
+	}
+
 	return q.Name, nil
 }
 
+// Work реализация интерфейса Membered, работа по чтению сообщений
 func (c *Consumer) Work(ctx context.Context, wg *sync.WaitGroup, channel *amqp091.Channel) error {
 
 	queName, err := c.initExchange(channel)
@@ -174,7 +126,7 @@ func (c *Consumer) Work(ctx context.Context, wg *sync.WaitGroup, channel *amqp09
 
 	switch c.al {
 	case Topics, Routing:
-		for _, topic := range c.Options.topics {
+		for _, topic := range c.ops.topics {
 			err := channel.QueueBind(
 				queName, // queue name
 				topic,   // routing key
@@ -201,13 +153,13 @@ func (c *Consumer) Work(ctx context.Context, wg *sync.WaitGroup, channel *amqp09
 	}
 
 	msgs, err := channel.Consume(
-		queName,                  // queue
-		"",                       // consumer
-		c.Options.copt.Autoack,   // auto ack
-		c.Options.copt.Exclusive, // exclusive
-		c.Options.copt.Nolocal,   // no local
-		c.Options.copt.Nowait,    // no wait
-		c.Options.copt.Arguments, // args
+		queName,              // queue
+		"",                   // consumer
+		c.ops.copt.Autoack,   // auto ack
+		c.ops.copt.Exclusive, // exclusive
+		c.ops.copt.Nolocal,   // no local
+		c.ops.copt.Nowait,    // no wait
+		c.ops.copt.Arguments, // args
 	)
 	if err != nil {
 		return fmt.Errorf("consume initialization error: %w", err)
@@ -228,30 +180,14 @@ func (c *Consumer) Work(ctx context.Context, wg *sync.WaitGroup, channel *amqp09
 
 			// вызываем обработчик события
 			if err := c.handler(m); err != nil {
-
 				return fmt.Errorf("work message handle error: %w", err)
 			}
-
-			/*case topic := <-c.topicAddCh:
-				err := channel.QueueBind(
-					queName, // queue name
-					topic,   // routing key
-					c.Name,  // exchange
-					false,
-					nil)
-				if err != nil {
-					return fmt.Errorf("queue %q topic %q bind error: %w", queName, topic, err)
+			if !c.ops.copt.Autoack {
+				if err = m.Ack(false); err != nil {
+					return fmt.Errorf("work message ask handle error: %w", err)
 				}
+			}
 
-			case topic := <-c.topicDelCh:
-				err := channel.QueueUnbind(
-					queName, // queue name
-					topic,   // routing key
-					c.Name,  // exchange
-					nil)
-				if err != nil {
-					return fmt.Errorf("queue %q topic %q unbind error: %w", queName, topic, err)
-				}*/
 		}
 	}
 
